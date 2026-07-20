@@ -267,7 +267,7 @@ public sealed class DashboardWebApplication : IAsyncDisposable
         {
             builder.Services.Configure<ForwardedHeadersOptions>(options =>
             {
-                options.ForwardedHeaders = ForwardedHeaders.XForwardedHost | ForwardedHeaders.XForwardedProto;
+                options.ForwardedHeaders = ForwardedHeaders.XForwardedHost | ForwardedHeaders.XForwardedProto | ForwardedHeaders.XForwardedFor;
 
                 // Only loopback proxies are allowed by default. Clear that restriction because forwarders are
                 // being enabled by explicit configuration.
@@ -349,6 +349,9 @@ public sealed class DashboardWebApplication : IAsyncDisposable
         builder.Services.AddAntiforgery(options =>
         {
             options.Cookie.Name = DashboardAntiForgeryCookieName;
+            options.Cookie.Path = "/";
+            options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+            options.Cookie.SameSite = SameSiteMode.None;
         });
 
         _app = builder.Build();
@@ -437,17 +440,59 @@ public sealed class DashboardWebApplication : IAsyncDisposable
             });
         });
 
+        // Use Forwarded Headers middleware if configured. Must run before UsePathBase
+        // so the request scheme and host are corrected for downstream middleware (e.g., OIDC redirect_uri).
+        if (builder.Configuration.GetBool(DashboardConfigNames.ForwardedHeaders.ConfigKey) ?? false)
+        {
+            _app.UseForwardedHeaders();
+        }
+
+        // Support running behind a reverse proxy with a path prefix (e.g., /sandbox/us/).
+        var pathBase = builder.Configuration["Dashboard:PathBase"];
+        if (!string.IsNullOrEmpty(pathBase))
+        {
+            var configuredPathBase = new PathString(pathBase.TrimEnd('/'));
+            _app.Use((context, next) =>
+            {
+                // Use X-Forwarded-Prefix if sent by the proxy, otherwise always set from config.
+                if (context.Request.Headers.TryGetValue("X-Forwarded-Prefix", out var forwardedPrefix) && forwardedPrefix.Count > 0)
+                {
+                    context.Request.PathBase = new PathString(forwardedPrefix.ToString().TrimEnd('/'));
+                }
+                else if (context.Request.Path.StartsWithSegments(configuredPathBase, out var remaining))
+                {
+                    context.Request.PathBase = configuredPathBase;
+                    context.Request.Path = remaining;
+                }
+                else
+                {
+                    context.Request.PathBase = configuredPathBase;
+                }
+                return next();
+            });
+        }
+
+        _app.UseRouting();
+
         // Redirect browser directly to /structuredlogs address if the dashboard is running without a resource service.
         // This is done to avoid immediately navigating in the Blazor app.
+        // Only applies to Frontend (browser) connections — OTLP telemetry requests must not be redirected.
         _app.Use(async (context, next) =>
         {
-            if (context.Request.Path.Equals(TargetLocationInterceptor.ResourcesPath, StringComparisons.UrlPath))
+            var connectionTypeFeature = context.Features.Get<IConnectionTypeFeature>();
+            var isFrontend = connectionTypeFeature == null || connectionTypeFeature.ConnectionTypes.Contains(ConnectionType.Frontend);
+
+            if (isFrontend && context.Request.Method == HttpMethods.Get)
             {
-                var client = context.RequestServices.GetRequiredService<IDashboardClient>();
-                if (!client.IsEnabled)
+                if (context.Request.Path.Equals(TargetLocationInterceptor.ResourcesPath, StringComparisons.UrlPath)
+                    || context.Request.Path.Value == string.Empty)
                 {
-                    context.Response.Redirect(TargetLocationInterceptor.StructuredLogsPath);
-                    return;
+                    var client = context.RequestServices.GetRequiredService<IDashboardClient>();
+                    if (!client.IsEnabled)
+                    {
+                        context.Response.Redirect(context.Request.PathBase + TargetLocationInterceptor.StructuredLogsPath);
+                        return;
+                    }
                 }
             }
 
@@ -497,20 +542,12 @@ public sealed class DashboardWebApplication : IAsyncDisposable
             }
         });
 
-        // Use Forwarded Headers middleware if configured.
-        if (builder.Configuration.GetBool(DashboardConfigNames.ForwardedHeaders.ConfigKey) ?? false)
-        {
-            _app.UseForwardedHeaders();
-        }
-
+        _app.UseAuthentication();
         _app.UseAuthorization();
 
         _app.UseMiddleware<BrowserSecurityHeadersMiddleware>();
         _app.UseAntiforgery();
 
-        _app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
-
-        // OTLP HTTP services.
         _app.MapHttpOtlpApi(dashboardOptions.Otlp);
 
         // OTLP gRPC services.
@@ -520,6 +557,9 @@ public sealed class DashboardWebApplication : IAsyncDisposable
 
         _app.MapTelemetryApi(dashboardOptions);
         _app.MapDashboardApi(dashboardOptions);
+
+        _app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
+
         _app.MapDashboardHealthChecks();
     }
 
@@ -807,6 +847,60 @@ public sealed class DashboardWebApplication : IAsyncDisposable
 
                     options.SignInScheme = CookieAuthenticationDefaults.AuthenticationScheme;
 
+                    options.Events = new()
+                    {
+                        OnRemoteFailure = context =>
+                        {
+                            // Break the auth loop: if OIDC callback fails (e.g. correlation failure),
+                            // redirect to root instead of triggering another challenge.
+                            var logger = context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Aspire.Dashboard.OIDC");
+                            logger.LogWarning("OIDC remote failure: {Error}", context.Failure?.Message);
+                            context.Response.Redirect(context.Request.PathBase + "/");
+                            context.HandleResponse();
+                            return Task.CompletedTask;
+                        },
+                        OnRedirectToIdentityProvider = context =>
+                        {
+                            // If this is an AJAX/fetch/SignalR request, return 401 instead of redirecting.
+                            if (string.Equals(context.Request.Headers["X-Requested-With"], "XMLHttpRequest", StringComparison.OrdinalIgnoreCase)
+                                || context.Request.Headers.Accept.ToString().Contains("application/json")
+                                || !string.IsNullOrEmpty(context.Request.Headers["blazor-enhanced-nav"]))
+                            {
+                                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                                context.HandleResponse();
+                                return Task.CompletedTask;
+                            }
+
+                            // Fix redirect URI to include path base. The OIDC middleware uses OriginalPathBase
+                            // which may not reflect our middleware-set PathBase.
+                            var currentPathBase = context.Request.PathBase.Value?.TrimEnd('/');
+                            if (!string.IsNullOrEmpty(currentPathBase) && context.ProtocolMessage.RedirectUri is { } redirectUri)
+                            {
+                                var uri = new Uri(redirectUri);
+                                if (!uri.AbsolutePath.StartsWith(currentPathBase, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    context.ProtocolMessage.RedirectUri = $"{uri.Scheme}://{uri.Authority}{currentPathBase}{uri.AbsolutePath}";
+                                }
+                            }
+
+                            return Task.CompletedTask;
+                        },
+                        OnAuthorizationCodeReceived = context =>
+                        {
+                            // Sync the redirect_uri for token exchange with what was sent to the IdP.
+                            var codePathBase = context.Request.PathBase.Value?.TrimEnd('/');
+                            if (!string.IsNullOrEmpty(codePathBase) && context.TokenEndpointRequest?.RedirectUri is { } tokenRedirectUri)
+                            {
+                                var uri = new Uri(tokenRedirectUri);
+                                if (!uri.AbsolutePath.StartsWith(codePathBase, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    context.TokenEndpointRequest.RedirectUri = $"{uri.Scheme}://{uri.Authority}{codePathBase}{uri.AbsolutePath}";
+                                }
+                            }
+                            return Task.CompletedTask;
+                        }
+                    };
+
                     // Scopes "openid" and "profile" are added by default, but need to be re-added
                     // in case configuration exists for Authentication:Schemes:OpenIdConnect:Scope.
                     if (!options.Scope.Contains(OpenIdConnectScope.OpenId))
@@ -819,11 +913,21 @@ public sealed class DashboardWebApplication : IAsyncDisposable
                         options.Scope.Add("profile");
                     }
 
-                    // Redirect to resources upon sign-in.
-                    options.CallbackPath = TargetLocationInterceptor.ResourcesPath;
+                    // Use the standard OIDC callback path for redirect URI compatibility.
+                    options.CallbackPath = "/signin-oidc";
 
-                    // Avoid "message.State is null or empty" due to use of CallbackPath above.
-                    options.SkipUnrecognizedRequests = true;
+                    // Do NOT use SkipUnrecognizedRequests. When true, correlation failures cause the
+                    // middleware to silently skip the callback, which falls through to auth challenge
+                    // and creates an infinite redirect loop. Instead, let OnRemoteFailure handle errors.
+
+                    // Ensure correlation and nonce cookies are sent on the callback request
+                    // regardless of path base configuration.
+                    options.CorrelationCookie.Path = "/";
+                    options.CorrelationCookie.SameSite = SameSiteMode.None;
+                    options.CorrelationCookie.SecurePolicy = CookieSecurePolicy.Always;
+                    options.NonceCookie.Path = "/";
+                    options.NonceCookie.SameSite = SameSiteMode.None;
+                    options.NonceCookie.SecurePolicy = CookieSecurePolicy.Always;
 
                     // Configure additional ClaimActions
                     var claimActions = dashboardOptions.Frontend.OpenIdConnect.ClaimActions;

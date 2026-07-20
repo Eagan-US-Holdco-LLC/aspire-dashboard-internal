@@ -8,7 +8,7 @@
 
 <div class="layout" style="@(_isNavMenuOpen ? "overflow: hidden;" : string.Empty)">
     <div class="aspire-icon">
-        <FluentAnchor Appearance="Appearance.Stealth" Href="/" Class="logo"
+        <FluentAnchor Appearance="Appearance.Stealth" Href="./" Class="logo"
                       title="@Loc[nameof(Layout.MainLayoutAspire)]"
                       aria-label="@Loc[nameof(Layout.MainLayoutAspire)]">
             <FluentIcon Value="@(new AspireIcons.Size24.Logo())"/>
@@ -18,13 +18,13 @@
     @if (ViewportInformation.IsDesktop)
     {
         <FluentHeader>
-            <FluentAnchor Appearance="Appearance.Stealth" Href="/" Class="logo">
+            <FluentAnchor Appearance="Appearance.Stealth" Href="./" Class="logo">
                 <ApplicationName/>
             </FluentAnchor>
             <div class="flex-filler"></div>
             <FluentAnchor Class="header-button"
                           Appearance="Appearance.Stealth"
-                          Href="https://aka.ms/aspire/repo" Target="_blank" Rel="noreferrer noopener"
+                          Href="https://github.com/Eagan-US-Holdco-LLC/aspire-dashboard-internal/tree/custom/elite" Target="_blank" Rel="noreferrer noopener"
                           Title="@Loc[nameof(Layout.MainLayoutAspireRepoLink)]" aria-label="@Loc[nameof(Layout.MainLayoutAspireRepoLink)]">
                 <FluentIcon Value="@(new AspireIcons.Size24.GitHub())" Color="Color.Neutral"/>
             </FluentAnchor>
@@ -67,7 +67,7 @@
     else
     {
         <FluentHeader>
-            <FluentAnchor Appearance="Appearance.Stealth" Href="/" Class="logo">
+            <FluentAnchor Appearance="Appearance.Stealth" Href="./" Class="logo">
                 <ApplicationName/>
             </FluentAnchor>
             <div class="flex-filler"></div>
